@@ -5,6 +5,7 @@ __pycache__/
 
 # C extensions
 *.so
+downloaded_videos
 
 # Distribution / packaging
 .Python
