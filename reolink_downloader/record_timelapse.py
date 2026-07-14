@@ -32,7 +32,7 @@ from datetime import datetime, timedelta
 from urllib.parse import quote
 
 import config
-from reolink import merge_videos, speed_up_video
+from reolink import speed_up_video
 
 
 def rtsp_url():
@@ -82,6 +82,58 @@ def record_segment(url, seconds, out_path):
     return os.path.exists(out_path) and os.path.getsize(out_path) > 100_000
 
 
+def concat_segments(segments, output_path):
+    """Losslessly join HEVC segments via MPEG-TS.
+
+    Live RTSP captures do NOT concatenate cleanly with the mp4 concat demuxer
+    (-c copy): the HEVC reference frames break at each segment boundary, so the
+    joined file becomes almost undecodable (only a handful of frames survive,
+    which is what made an earlier build produce a 9-frame, unwatchable clip).
+
+    Converting each segment to an MPEG-TS elementary stream with the
+    hevc_mp4toannexb bitstream filter and then joining with ffmpeg's concat
+    PROTOCOL produces a clean, fully decodable file. We run ffmpeg from the
+    output directory and use relative .ts names so paths with spaces (e.g.
+    "...\\Noman traders\\...") don't trip up the concat: protocol parser.
+    """
+    if not segments:
+        return None
+    if len(segments) == 1:
+        return segments[0]
+
+    work_dir = os.path.dirname(os.path.abspath(output_path))
+    ts_names = []
+    for i, seg in enumerate(segments):
+        ts_name = f"_concat_{i:03d}.ts"
+        r = subprocess.run(
+            ["ffmpeg", "-y", "-loglevel", "error", "-i", os.path.abspath(seg),
+             "-c", "copy", "-bsf:v", "hevc_mp4toannexb", "-f", "mpegts", ts_name],
+            cwd=work_dir, capture_output=True, text=True)
+        if r.returncode != 0 or not os.path.exists(os.path.join(work_dir, ts_name)):
+            print(f"  TS convert failed for {os.path.basename(seg)}: "
+                  f"{r.stderr.strip()[-200:]}")
+            return None
+        ts_names.append(ts_name)
+
+    concat_arg = "concat:" + "|".join(ts_names)
+    print(f"\nMerging {len(segments)} segments -> {os.path.basename(output_path)}")
+    r = subprocess.run(
+        ["ffmpeg", "-y", "-loglevel", "error", "-i", concat_arg,
+         "-c", "copy", "-movflags", "+faststart", os.path.basename(output_path)],
+        cwd=work_dir, capture_output=True, text=True)
+
+    for ts_name in ts_names:                       # clean up intermediates
+        ts_path = os.path.join(work_dir, ts_name)
+        if os.path.exists(ts_path):
+            os.remove(ts_path)
+
+    if r.returncode == 0 and os.path.exists(output_path):
+        print(f"  Merged OK - {os.path.getsize(output_path) / (1024 ** 3):.2f} GB")
+        return output_path
+    print(f"  Merge failed: {r.stderr.strip()[-200:]}")
+    return None
+
+
 def record_live(url, total_seconds, work_dir, tag):
     """Record the live stream for total_seconds, stitching across disconnects.
 
@@ -116,7 +168,7 @@ def record_live(url, total_seconds, work_dir, tag):
         return segments[0]
 
     merged = os.path.join(work_dir, f"{tag}_raw.mp4")
-    result = merge_videos(segments, merged)
+    result = concat_segments(segments, merged)
     if result:
         for seg in segments:               # free the per-segment files
             if os.path.exists(seg):
@@ -181,7 +233,7 @@ def main():
         print('ERROR: --start must be "YYYY-MM-DD HH:MM:SS", e.g. "2026-07-15 06:00:00"')
         sys.exit(1)
 
-    duration_s = int(args.duration_hours * 3600)
+    duration_s = int(args.duration_hours * 60)
     end_dt = start_dt + timedelta(seconds=duration_s)
     os.makedirs(config.WORK_DIR, exist_ok=True)
 
