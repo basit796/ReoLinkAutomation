@@ -10,6 +10,10 @@ import subprocess
 # Disable SSL warnings for self-signed certificates
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+
+class CameraRefusingDownloads(Exception):
+    """The camera's file-serving service is wedged and needs a reboot."""
+
 def get_token(camera_ip, username, password, port=443):
     """Get authentication token from the camera"""
     url = f"https://{camera_ip}:{port}/api.cgi?cmd=Login"
@@ -35,6 +39,22 @@ def get_token(camera_ip, username, password, port=443):
             return token
     print(f"Authentication failed: {response.text}")
     return None
+
+def logout(camera_ip, token, port=443):
+    """Release the session on the camera.
+
+    The camera allows only a few concurrent sessions, and abandoned ones can
+    wedge its download service. Always call this, including on Ctrl+C.
+    """
+    if not token:
+        return
+    url = f"https://{camera_ip}:{port}/api.cgi?cmd=Logout&token={token}"
+    try:
+        requests.post(url, json=[{"cmd": "Logout", "param": {}}], verify=False, timeout=10)
+        print("Logged out (session released).")
+    except Exception as e:
+        print(f"Logout failed (session may linger): {e}")
+
 
 def search_recordings(camera_ip, token, channel, start_time, end_time, port=443):
     """Search for recordings using the Search API"""
@@ -117,19 +137,76 @@ def download_recording(camera_ip, token, filename, output_path, expected_size=0,
             return False
 
         got = os.path.getsize(output_path) if os.path.exists(output_path) else 0
-        if result.returncode == 0 and got >= min_ok:
+
+        # Trust the byte count over curl's exit code. The camera closes TLS without
+        # close_notify, so curl reports exit 56 even on a fully-received file.
+        if got >= min_ok:
+            note = " (ignoring benign TLS close)" if result.returncode else ""
             print(f"  OK - {got / (1024 * 1024):.2f} MB "
-                  f"(expected ~{expected_size / (1024 * 1024):.2f} MB)")
+                  f"(expected ~{expected_size / (1024 * 1024):.2f} MB){note}")
             return True
 
-        reason = (result.stderr.strip()[:120] or f"curl exit {result.returncode}") \
-            if result.returncode else \
-            f"short read {got / (1024 * 1024):.2f} MB / ~{expected_size / (1024 * 1024):.2f} MB"
-        print(f"  failed: {reason} - retrying")
+        # Zero bytes + connection dropped = the camera's download service is refusing
+        # us outright. Hammering it makes things worse, so bail out early.
+        if got == 0 and result.returncode == 56:
+            print("  camera closed the connection with 0 bytes")
+            if attempt >= 2:
+                # Signal the caller to stop the entire run - continuing would just
+                # hammer a camera that is refusing every download.
+                raise CameraRefusingDownloads(
+                    "The camera accepted the request then closed the connection with 0 bytes. "
+                    "Its file-serving service is wedged. Reboot the camera (a reboot keeps all "
+                    "recordings and settings) and run this again."
+                )
+        else:
+            print(f"  failed: short read {got / (1024 * 1024):.2f} MB "
+                  f"/ ~{expected_size / (1024 * 1024):.2f} MB - retrying")
         time.sleep(2)
 
     print(f"  FAILED after {max_retries} attempts")
     return False
+
+# def download_recording(camera_ip, token, filename, output_path, expected_size=0, port=443, max_retries=15):
+#     """Download using resumable curl requests. Each attempt continues from
+#     where the last one left off via HTTP Range (-C -), instead of restarting
+#     the whole file when the camera drops the connection.
+#     """
+#     output = os.path.basename(filename)
+#     url = (f"https://{camera_ip}:{port}/cgi-bin/api.cgi?cmd=Download"
+#            f"&source={filename}&output={output}&token={token}")
+
+#     min_ok = int(expected_size * 0.99) if expected_size else 1
+
+#     for attempt in range(1, max_retries + 1):
+#         got_before = os.path.getsize(output_path) if os.path.exists(output_path) else 0
+
+#         cmd = [
+#             "curl", "-k", "-sS", "-o", output_path,
+#             "-C", "-",  # resume from wherever the partial file left off
+#             "--connect-timeout", "15", "--max-time", "120",
+#         ]
+#         cmd.append(url)
+
+#         print(f"  attempt {attempt}/{max_retries}: {output} (resuming from {got_before/(1024*1024):.2f} MB)")
+#         result = subprocess.run(cmd, capture_output=True, text=True)
+
+#         got = os.path.getsize(output_path) if os.path.exists(output_path) else 0
+
+#         if got >= min_ok:
+#             print(f"  OK - {got / (1024 * 1024):.2f} MB "
+#                   f"(expected ~{expected_size / (1024 * 1024):.2f} MB)")
+#             return True
+
+#         if got == got_before:
+#             # No progress at all this attempt - short pause before retrying
+#             print(f"  no progress ({got/(1024*1024):.2f} MB) - retrying")
+#             time.sleep(3)
+#         else:
+#             print(f"  progress: {got/(1024*1024):.2f} / ~{expected_size/(1024*1024):.2f} MB - continuing")
+#             time.sleep(1)
+
+#     print(f"  FAILED after {max_retries} attempts - got {got/(1024*1024):.2f} MB of ~{expected_size/(1024*1024):.2f} MB")
+#     return False
 
 
 def merge_videos(video_files, output_path):
@@ -251,6 +328,20 @@ def main():
     if not token:
         print("Failed to authenticate with camera")
         return
+
+    # Always release the session, even on Ctrl+C. Abandoned sessions are what
+    # wedge the camera's download service.
+    try:
+        run(args, token, start_time, end_time)
+    except CameraRefusingDownloads as e:
+        print(f"\n*** ABORTED ***\n{e}")
+    except KeyboardInterrupt:
+        print("\nInterrupted - releasing camera session before exit...")
+    finally:
+        logout(args.ip, token, args.port)
+
+
+def run(args, token, start_time, end_time):
 
     # Search for recordings
     recordings = search_recordings(args.ip, token, args.channel, start_time, end_time, args.port)

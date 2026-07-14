@@ -1,3 +1,9 @@
+# Project secrets & outputs (never commit)
+reolink_downloader/config.py
+reolink_downloader/service_account.json
+reolink_downloader/output/
+service_account.json
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
