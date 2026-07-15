@@ -1,8 +1,13 @@
 # Project secrets & outputs (never commit)
 reolink_downloader/config.py
-reolink_downloader/service_account.json
+reolink_downloader/service_account*.json
+reolink_downloader/oauth_client*.json
+reolink_downloader/token.json
 reolink_downloader/output/
-service_account.json
+reolink_downloader/logs/
+service_account*.json
+oauth_client*.json
+token.json
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

@@ -13,9 +13,17 @@ RTSP_PORT = 554
 RTSP_STREAM_PATH = "h265Preview_01_main"
 
 # ===================== Recording =====================
-# You pass only the START time on the command line. The recording ends this
-# many hours later. (End time = start + RECORD_DURATION_HOURS.)
+# Default length of one recording job. Starting a job records from "now" for
+# this many hours (override per-job via the API / CLI).
 RECORD_DURATION_HOURS = 4
+
+# Record in fixed-length chunks so free disk can be checked between them and a
+# stop doesn't wait hours. 600s = 10 min chunks -> a 4h job is ~24 chunks.
+SEGMENT_SECONDS = 600
+
+# ===================== Storage guards (small disk, e.g. 30 GB EC2) =====================
+DISK_MIN_FREE_GB = 6          # stop capturing early if free disk drops below this
+WATCHDOG_STALL_SECONDS = 30   # kill+reconnect if recording produces no new bytes this long
 
 # ===================== Speed-up / output =====================
 SPEED_FACTOR = 200        # 4h of footage -> 72s at 200x
@@ -37,9 +45,23 @@ SPEED_CRF = 18            # encode quality, lower = better (18 ~ visually lossle
 #   6. Open that folder in the browser; the URL ends with the folder id:
 #      https://drive.google.com/drive/folders/<THIS_IS_THE_FOLDER_ID>
 #      Paste it below.
-GDRIVE_CREDENTIALS_FILE = "service_account.json"
-GDRIVE_FOLDER_ID = ""     # target Drive folder id (shared with the service account)
+# Auth mode:
+#   "oauth"           -> upload as a real Google user (uses THAT user's Drive
+#                        quota; works with a normal Gmail). Create token.json once
+#                        with gdrive_auth.py (needs an OAuth "Desktop app" client).
+#   "service_account" -> upload as the service account. This ONLY works into a
+#                        Shared Drive (a service account has no personal quota).
+GDRIVE_AUTH = "oauth"
+GDRIVE_OAUTH_CLIENT_FILE = "oauth_client.json"    # OAuth Desktop client secret JSON
+GDRIVE_OAUTH_TOKEN_FILE = "token.json"            # produced by gdrive_auth.py
+GDRIVE_CREDENTIALS_FILE = "service_account.json"  # used only for GDRIVE_AUTH="service_account"
+GDRIVE_FOLDER_ID = ""     # target Drive folder id (you must have write access to it)
 
 # ===================== Local files =====================
 WORK_DIR = "./output"
+LOG_DIR = "./logs"
 DELETE_LOCAL_AFTER_UPLOAD = True   # remove local files once the upload succeeds
+
+# ===================== FastAPI control server =====================
+SERVER_HOST = "0.0.0.0"   # bind address (use 127.0.0.1 to keep it local-only)
+SERVER_PORT = 8000
