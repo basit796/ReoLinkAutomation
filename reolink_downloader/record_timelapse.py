@@ -233,7 +233,7 @@ def main():
         print('ERROR: --start must be "YYYY-MM-DD HH:MM:SS", e.g. "2026-07-15 06:00:00"')
         sys.exit(1)
 
-    duration_s = int(args.duration_hours * 60)
+    duration_s = int(args.duration_hours * 3600)
     end_dt = start_dt + timedelta(seconds=duration_s)
     os.makedirs(config.WORK_DIR, exist_ok=True)
 
