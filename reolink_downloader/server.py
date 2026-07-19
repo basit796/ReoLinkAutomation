@@ -78,6 +78,8 @@ def health():
 def status():
     if _job is None:
         return {"state": "idle",
+                "speed_factor": config.SPEED_FACTOR,
+                "duration_hours": config.RECORD_DURATION_HOURS,
                 "disk_free_gb": round(free_gb(config.WORK_DIR), 2),
                 "alive": False}
     return _job.status()

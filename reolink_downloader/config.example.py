@@ -26,10 +26,20 @@ DISK_MIN_FREE_GB = 6          # stop capturing early if free disk drops below th
 WATCHDOG_STALL_SECONDS = 30   # kill+reconnect if recording produces no new bytes this long
 
 # ===================== Speed-up / output =====================
-SPEED_FACTOR = 200        # 4h of footage -> 72s at 200x
+SPEED_FACTOR = 650        # 4h of footage -> ~22s at 650x
 SPEED_FPS = 30            # output frame rate
 SPEED_WIDTH = 3840        # output width (keeps 32:9). 0 = keep native 7680.
 SPEED_CRF = 18            # encode quality, lower = better (18 ~ visually lossless)
+
+# ===================== Branded intro / thumbnail =====================
+# Shown for INTRO_SECONDS at the start of the timelapse, so it becomes the
+# thumbnail everywhere (Drive/YouTube build their own from an early frame; a
+# thumbnail set through the Drive API is ignored for videos). The image is
+# fitted in the middle over a blurred copy of itself, so a 3:2 graphic keeps all
+# its branding on the ultra-wide video instead of being cropped.
+INTRO_IMAGE = "thumbnail.jpeg"   # relative paths resolve next to pipeline.py; "" = off
+INTRO_SECONDS = 1
+INTRO_BLUR_SIGMA = 30            # blur strength of the side background
 
 # ===================== Google Drive =====================
 # Uses a Google service account (headless, no browser needed).

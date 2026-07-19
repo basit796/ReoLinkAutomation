@@ -115,6 +115,31 @@ def probe_duration(path):
         return 0.0
 
 
+def probe_resolution(path, cwd=None):
+    """(width, height) of the first video stream, or (0, 0) if unknown.
+    Works for a plain file or a 'concat:a.ts|b.ts' input."""
+    r = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=width,height", "-of", "csv=s=x:p=0", path],
+        capture_output=True, text=True, cwd=cwd)
+    try:
+        w, h = r.stdout.strip().split("x")[:2]
+        return int(w), int(h)
+    except (ValueError, TypeError):
+        return 0, 0
+
+
+def intro_image_path():
+    """Absolute path of the branded intro/thumbnail image, or None if not set
+    or missing. A relative INTRO_IMAGE is resolved next to this file."""
+    name = _cfg("INTRO_IMAGE", "")
+    if not name:
+        return None
+    path = name if os.path.isabs(name) else os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), name)
+    return path if os.path.exists(path) else None
+
+
 # --------------------------------------------------------------------------- #
 # The job
 # --------------------------------------------------------------------------- #
@@ -178,6 +203,7 @@ class RecordingJob:
             "error": self.error,
             "tag": self.tag,
             "duration_hours": self.duration_hours,
+            "speed_factor": config.SPEED_FACTOR,
             "created_at": self.created_at.isoformat(timespec="seconds"),
             "record_started_at": self.record_started_at.isoformat(timespec="seconds")
                 if self.record_started_at else None,
@@ -340,6 +366,43 @@ class RecordingJob:
             os.remove(seg)                    # free the mp4 right away
         return ts_names
 
+    def _intro_filter(self, input_arg, cwd, fps):
+        """Build the filter chain that puts the branded image on the front of
+        the timelapse for INTRO_SECONDS. Returns (seconds, filter_string) or
+        None if there is no image / we can't work out the output size (in which
+        case the video is produced exactly as before -- the intro is a bonus,
+        never a reason to fail a 4-hour job).
+
+        The concat filter needs both inputs at the same size, so the intro is
+        rendered at the timelapse's own resolution: the image fitted in the
+        middle over a blurred, cropped copy of itself.
+        """
+        secs = _cfg("INTRO_SECONDS", 1)
+        image = intro_image_path()
+        if not image or not secs:
+            return None
+
+        src_w, src_h = probe_resolution(input_arg, cwd=cwd)
+        if not src_w or not src_h:
+            self.log.warning("Could not probe input size; skipping intro image.")
+            return None
+        width = _cfg("SPEED_WIDTH", 3840)
+        if width:
+            out_w = int(width)
+            out_h = int(round(src_h * out_w / src_w / 2)) * 2   # matches scale=W:-2
+        else:
+            out_w, out_h = src_w, src_h
+
+        blur = _cfg("INTRO_BLUR_SIGMA", 30)
+        self.log.info("Intro: %s (%ss) at %dx%d.",
+                      os.path.basename(image), secs, out_w, out_h)
+        return secs, (
+            f"[1:v]scale={out_w}:{out_h}:force_original_aspect_ratio=increase,"
+            f"crop={out_w}:{out_h},gblur=sigma={blur}[bg];"
+            f"[2:v]scale={out_w}:{out_h}:force_original_aspect_ratio=decrease[fg];"
+            f"[bg][fg]overlay=(W-w)/2:(H-h)/2,fps={fps},setsar=1[intro];"
+        )
+
     def _speed_up(self, input_arg, cwd, out_name):
         """Speed up SPEED_FACTOR x, strip audio, small re-encode. input_arg is
         either a relative .ts filename, a 'concat:a.ts|b.ts' string, or an
@@ -352,16 +415,31 @@ class RecordingJob:
         vf = f"setpts=PTS/{factor},fps={fps}"
         if width:
             vf += f",scale={width}:-2"
-        cmd = [
-            "ffmpeg", "-y", "-loglevel", "error",
-            "-skip_frame", "nokey",
-            "-i", input_arg,
-            "-filter:v", vf,
-            "-an",
-            "-c:v", "libx264", "-preset", "slow", "-crf", str(crf),
-            "-pix_fmt", "yuv420p",
-            out_name,
-        ]
+
+        cmd = ["ffmpeg", "-y", "-loglevel", "error",
+               "-skip_frame", "nokey", "-i", input_arg]
+
+        intro = self._intro_filter(input_arg, cwd, fps)
+        if intro:
+            intro_secs, intro_filter = intro
+            image = intro_image_path()
+            # The image goes in twice: once blurred+cropped as the wide
+            # background, once fitted on top -- the branding is 3:2 but the
+            # video is ultra-wide, so plain scaling would crop the logo away.
+            for _ in range(2):
+                cmd += ["-loop", "1", "-t", str(intro_secs),
+                        "-framerate", str(fps), "-i", image]
+            cmd += ["-filter_complex",
+                    f"[0:v]{vf},setsar=1[main];{intro_filter}"
+                    "[intro][main]concat=n=2:v=1:a=0[out]",
+                    "-map", "[out]"]
+        else:
+            cmd += ["-filter:v", vf]
+
+        cmd += ["-an",
+                "-c:v", "libx264", "-preset", "slow", "-crf", str(crf),
+                "-pix_fmt", "yuv420p",
+                out_name]
         self.log.info("Speeding up %sx -> %s", factor, out_name)
         result = self._run_ffmpeg(cmd, log_path, cwd=cwd)
         out_path = os.path.join(cwd, out_name)
