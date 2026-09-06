@@ -1,0 +1,20 @@
+[Unit]
+Description=Reolink timelapse recorder (FastAPI control server)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ec2-user
+# Adjust this path if you cloned somewhere else:
+WorkingDirectory=/home/ec2-user/ReoLinkAutomation/reolink_downloader
+# Use the venv's python so fastapi/uvicorn/google libs are found:
+ExecStart=/home/ec2-user/ReoLinkAutomation/reolink_downloader/.venv/bin/python server.py
+Restart=on-failure
+RestartSec=5
+# Give a running recording time to finalize + clean up on stop/restart:
+TimeoutStopSec=120
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=multi-user.target

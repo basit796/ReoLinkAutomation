@@ -117,16 +117,23 @@ def probe_duration(path):
 
 def probe_resolution(path, cwd=None):
     """(width, height) of the first video stream, or (0, 0) if unknown.
-    Works for a plain file or a 'concat:a.ts|b.ts' input."""
+
+    `path` should be a single file. A 'concat:a.ts|b.ts' string makes ffprobe
+    print one 'WxH' line PER concatenated file, so callers must probe one real
+    file, not the concat input. We still defensively take the first line."""
     r = subprocess.run(
         ["ffprobe", "-v", "error", "-select_streams", "v:0",
          "-show_entries", "stream=width,height", "-of", "csv=s=x:p=0", path],
         capture_output=True, text=True, cwd=cwd)
-    try:
-        w, h = r.stdout.strip().split("x")[:2]
-        return int(w), int(h)
-    except (ValueError, TypeError):
-        return 0, 0
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if "x" in line:
+            try:
+                w, h = line.split("x")[:2]
+                return int(w), int(h)
+            except (ValueError, TypeError):
+                break
+    return 0, 0
 
 
 def intro_image_path():
@@ -160,6 +167,11 @@ class RecordingJob:
         self.segment_seconds = int(_cfg("SEGMENT_SECONDS", 600))
         self.min_free_gb = float(_cfg("DISK_MIN_FREE_GB", 6))
         self.stall_seconds = int(_cfg("WATCHDOG_STALL_SECONDS", 30))
+        # A chunk shorter than this is treated as a failed/empty capture (the
+        # stream stalled and the watchdog killed ffmpeg before real video came).
+        # Such near-empty chunks break the TS join, so we reject + reconnect
+        # instead of keeping them. Real chunks are ~600s; 3s is a safe floor.
+        self.min_chunk_seconds = float(_cfg("MIN_CHUNK_SECONDS", 3))
 
         self.state = JobState.IDLE
         self.error = None
@@ -328,9 +340,10 @@ class RecordingJob:
                           seg_idx, this_len, remaining / 60, free)
             result = self._run_ffmpeg(cmd, log_path, watch_path=seg_path)
 
-            good = os.path.exists(seg_path) and os.path.getsize(seg_path) > 100_000
+            has_bytes = os.path.exists(seg_path) and os.path.getsize(seg_path) > 100_000
+            dur = probe_duration(seg_path) if has_bytes else 0.0
+            good = has_bytes and dur >= self.min_chunk_seconds
             if good:
-                dur = probe_duration(seg_path)
                 segments.append(seg_path)
                 self.segments_captured = len(segments)
                 self.captured_seconds += dur
@@ -341,8 +354,14 @@ class RecordingJob:
                     os.remove(seg_path)
                 if result == "stopped":
                     break
-                self.log.warning("  chunk %d failed (%s); reconnecting in 5s...",
-                                 seg_idx, result)
+                if has_bytes:
+                    # ffmpeg "succeeded" but the stream stalled -> near-empty chunk
+                    self.log.warning("  chunk %d too short (%.0fs < %.0fs floor); "
+                                     "stream stalled, reconnecting in 5s...",
+                                     seg_idx, dur, self.min_chunk_seconds)
+                else:
+                    self.log.warning("  chunk %d failed (%s); reconnecting in 5s...",
+                                     seg_idx, result)
                 if self._stop_event.wait(5):
                     break
 
@@ -351,20 +370,60 @@ class RecordingJob:
     def _to_ts(self, segments):
         """Convert each mp4 chunk to an MPEG-TS elementary stream and DELETE the
         mp4 immediately, so disk usage stays flat (never holds mp4 + ts together).
-        Returns the relative .ts names (ffmpeg is run with cwd=work_dir)."""
+        A chunk that fails to convert (e.g. a corrupt segment from a glitchy
+        stream) is SKIPPED rather than aborting the whole job, so one bad chunk
+        can't discard hours of otherwise-good footage. Returns the relative .ts
+        names (ffmpeg is run with cwd=work_dir); an empty list only if every
+        chunk failed."""
         log_path = os.path.join(self.work_dir, f"{self.tag}_ffmpeg.log")
         ts_names = []
+        skipped = 0
         for i, seg in enumerate(segments):
             ts_name = f"{self.tag}_ts{i:03d}.ts"
             cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", os.path.abspath(seg),
                    "-c", "copy", "-bsf:v", "hevc_mp4toannexb", "-f", "mpegts", ts_name]
             result = self._run_ffmpeg(cmd, log_path, cwd=self.work_dir)
             if result != "ok" or not os.path.exists(os.path.join(self.work_dir, ts_name)):
-                self.log.error("TS convert failed for %s (%s).", os.path.basename(seg), result)
-                return None
+                self.log.warning("TS convert failed for %s (%s); skipping this chunk.",
+                                 os.path.basename(seg), result)
+                skipped += 1
+                bad_ts = os.path.join(self.work_dir, ts_name)
+                if os.path.exists(bad_ts):
+                    os.remove(bad_ts)         # drop the partial/empty ts
+                if os.path.exists(seg):
+                    os.remove(seg)            # free the bad mp4 too
+                continue
             ts_names.append(ts_name)
             os.remove(seg)                    # free the mp4 right away
+        if skipped:
+            self.log.warning("Prepared %d chunk(s) for join; skipped %d bad chunk(s).",
+                             len(ts_names), skipped)
         return ts_names
+
+    def _crop_spec(self):
+        """(left, right, top, bottom) fractions to trim from the native frame,
+        or None if no crop is configured. Values are 0..1 of each side."""
+        L = float(_cfg("CROP_LEFT", 0.0))
+        R = float(_cfg("CROP_RIGHT", 0.0))
+        T = float(_cfg("CROP_TOP", 0.0))
+        B = float(_cfg("CROP_BOTTOM", 0.0))
+        if (L, R, T, B) == (0.0, 0.0, 0.0, 0.0):
+            return None
+        if L + R >= 1.0 or T + B >= 1.0 or min(L, R, T, B) < 0:
+            self.log.warning("CROP_* values invalid (%s); ignoring crop.",
+                             (L, R, T, B))
+            return None
+        return L, R, T, B
+
+    def _crop_filter(self):
+        """Leading 'crop=...,' filter (empty string if no crop). Uses iw/ih so
+        it is resolution-independent and runs before the scale-down."""
+        spec = self._crop_spec()
+        if not spec:
+            return ""
+        L, R, T, B = spec
+        return (f"crop=iw*{1 - L - R:.6f}:ih*{1 - T - B:.6f}:"
+                f"iw*{L:.6f}:ih*{T:.6f},")
 
     def _intro_filter(self, input_arg, cwd, fps):
         """Build the filter chain that puts the branded image on the front of
@@ -382,10 +441,23 @@ class RecordingJob:
         if not image or not secs:
             return None
 
-        src_w, src_h = probe_resolution(input_arg, cwd=cwd)
+        # A 'concat:a.ts|b.ts' input makes ffprobe emit one line per file, so
+        # probe a single real file instead: the first concat member, else the
+        # input itself (a plain .ts filename or an absolute .mp4 path).
+        if input_arg.startswith("concat:"):
+            probe_target = input_arg[len("concat:"):].split("|", 1)[0]
+        else:
+            probe_target = input_arg
+        src_w, src_h = probe_resolution(probe_target, cwd=cwd)
         if not src_w or not src_h:
             self.log.warning("Could not probe input size; skipping intro image.")
             return None
+        # The intro must match the FINAL (cropped) aspect so concat sizes agree.
+        spec = self._crop_spec()
+        if spec:
+            L, R, T, B = spec
+            src_w = src_w * (1 - L - R)
+            src_h = src_h * (1 - T - B)
         width = _cfg("SPEED_WIDTH", 3840)
         if width:
             out_w = int(width)
@@ -412,7 +484,7 @@ class RecordingJob:
         fps = _cfg("SPEED_FPS", 30)
         width = _cfg("SPEED_WIDTH", 3840)
         crf = _cfg("SPEED_CRF", 18)
-        vf = f"setpts=PTS/{factor},fps={fps}"
+        vf = f"{self._crop_filter()}setpts=PTS/{factor},fps={fps}"
         if width:
             vf += f",scale={width}:-2"
 

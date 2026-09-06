@@ -1,0 +1,15 @@
+{
+  "SPEED_FACTOR": 312,
+  "SPEED_WIDTH": 5990,
+  "SPEED_CRF": 18,
+  "INTRO_SECONDS": 1.0,
+  "CROP_LEFT": 0.22,
+  "CROP_RIGHT": 0.0,
+  "CROP_TOP": 0.03,
+  "CROP_BOTTOM": 0.24,
+  "GDRIVE_FOLDER_ID": "1OAmwqeYSDaQJnNYTDuPXlx5b-2mRVS-I",
+  "enabled": true,
+  "start_time": "06:00",
+  "end_time": "08:00",
+  "timezone": "America/New_York"
+}
