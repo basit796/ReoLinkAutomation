@@ -143,6 +143,24 @@ def _start_scheduler():
 # --------------------------------------------------------------------------- #
 # Web control panel
 # --------------------------------------------------------------------------- #
+def _drive_service():
+    """A Drive v3 service via the pipeline's own auth (unstarted job, no camera)."""
+    return RecordingJob()._drive_service()
+
+
+def _current_audio_name():
+    """Best-effort: the latest audio filename in the Drive folder, or None."""
+    folder = getattr(config, "GDRIVE_AUDIO_FOLDER_ID", "")
+    if not folder:
+        return None
+    try:
+        job = RecordingJob()
+        latest = job._latest_audio_file(job._drive_service(), folder)
+        return latest[1] if latest else None
+    except Exception:  # never break the panel over a Drive hiccup
+        return None
+
+
 def _next_run_text(s):
     if not s.get("enabled"):
         return "Daily schedule is OFF"
@@ -163,6 +181,8 @@ def _render_panel(msg="", errors=None):
     state = st.get("state", "idle")
     disk = round(free_gb(config.WORK_DIR), 2)
     est = (dur * 3600) / max(int(s.get("SPEED_FACTOR") or 1), 1) + float(s.get("INTRO_SECONDS") or 0)
+    audio_name = _current_audio_name() or "— none uploaded yet —"
+    audio_on = "ON" if s.get("AUDIO_ENABLED") else "OFF"
     err_html = ""
     if errors:
         err_html = "<div class='err'>" + "<br>".join(errors) + "</div>"
@@ -245,6 +265,11 @@ def _render_panel(msg="", errors=None):
       <option value="true" {"selected" if s.get("enabled") else ""}>ON — record every day</option>
       <option value="false" {"" if s.get("enabled") else "selected"}>OFF — manual only</option>
     </select></label>
+  <label>Background audio
+    <select name="AUDIO_ENABLED">
+      <option value="true" {"selected" if s.get("AUDIO_ENABLED") else ""}>ON — add latest audio to video</option>
+      <option value="false" {"" if s.get("AUDIO_ENABLED") else "selected"}>OFF — silent video</option>
+    </select></label>
   <div class="est" id="est">Estimated video length: <b id="len">…</b>
     <span class="muted">(recording window ÷ speed + intro)</span></div>
 
@@ -278,6 +303,17 @@ def _render_panel(msg="", errors=None):
     <button class="stop" type="submit" {"" if running else "disabled"}>■ Stop current job</button>
   </form>
   <p class="muted">“Record now” starts a recording immediately using the current window length ({dur:.2f} h).</p>
+</div>
+
+<div class="card">
+  <h3 style="margin:0 0 6px">🎵 Background audio <span class="muted" style="font-weight:400">({audio_on})</span></h3>
+  <p style="margin:0 0 10px">Current track on the video: <b>{audio_name}</b></p>
+  <form method="post" action="/upload-audio" enctype="multipart/form-data">
+    <input type="file" name="audio" accept="audio/*" required>
+    <div style="margin-top:10px"><button class="primary" type="submit">⬆ Upload audio</button></div>
+  </form>
+  <p class="muted">Upload an audio file and it becomes the newest track — every new video from then on uses it.
+    Shorter audio is looped, longer is trimmed to the video length. Turn it on/off with “Background audio” above.</p>
 </div>
 
 <script>
@@ -315,6 +351,44 @@ async def save_settings(request: Request):
              merged["start_time"], merged["end_time"],
              merged["SPEED_FACTOR"], merged["enabled"])
     return HTMLResponse(_render_panel(msg="Saved. The next recording will use these settings."))
+
+
+@app.post("/upload-audio", response_class=HTMLResponse)
+async def upload_audio(request: Request):
+    """Receive an audio file from the panel and upload it into the Drive audio
+    folder, where it becomes the newest track used by the next video."""
+    from googleapiclient.http import MediaFileUpload
+    form = await request.form()
+    up = form.get("audio")
+    if up is None or not getattr(up, "filename", ""):
+        return HTMLResponse(_render_panel(errors=["Choose an audio file first."]), status_code=400)
+    folder = getattr(config, "GDRIVE_AUDIO_FOLDER_ID", "")
+    if not folder:
+        return HTMLResponse(_render_panel(errors=["No audio folder configured (GDRIVE_AUDIO_FOLDER_ID)."]),
+                            status_code=400)
+    tmp = os.path.join(config.WORK_DIR, "_audio_upload_" + os.path.basename(up.filename))
+    try:
+        os.makedirs(config.WORK_DIR, exist_ok=True)
+        data = await up.read()
+        with open(tmp, "wb") as f:
+            f.write(data)
+        service = _drive_service()
+        media = MediaFileUpload(tmp, mimetype=(up.content_type or "audio/mpeg"), resumable=True)
+        service.files().create(
+            body={"name": up.filename, "parents": [folder]},
+            media_body=media, fields="id,name", supportsAllDrives=True).execute()
+        log.info("Audio uploaded via panel: %s (%d bytes).", up.filename, len(data))
+    except Exception as e:  # noqa: BLE001
+        log.exception("Audio upload failed: %s", e)
+        return HTMLResponse(_render_panel(errors=[f"Audio upload failed: {e}"]), status_code=500)
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+    return HTMLResponse(_render_panel(
+        msg=f"Audio “{up.filename}” uploaded — it will be added to the next video."))
 
 
 @app.get("/health")

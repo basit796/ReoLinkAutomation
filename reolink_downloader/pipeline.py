@@ -561,12 +561,106 @@ class RecordingJob:
                 f"Service account file not found: {cred_file}. See config.example.py.")
         return service_account.Credentials.from_service_account_file(cred_file, scopes=scopes)
 
-    def _upload(self, local_path):
+    def _drive_service(self):
+        """Build an authenticated Drive v3 service (shared by upload + audio)."""
         from googleapiclient.discovery import build
+        creds = self._drive_credentials()
+        return build("drive", "v3", credentials=creds)
+
+    # ----- background audio ---------------------------------------------- #
+    def _latest_audio_file(self, service, folder_id):
+        """Newest audio file the app can see in the Drive folder -> (id, name).
+
+        Under the drive.file scope this returns files the app itself created
+        (i.e. everything uploaded via the panel's /upload-audio). Returns None
+        if the folder has no audio."""
+        AUDIO_EXT = (".mp3", ".m4a", ".aac", ".wav", ".ogg", ".oga",
+                     ".flac", ".opus", ".wma", ".mp4")
+        resp = service.files().list(
+            q=f"'{folder_id}' in parents and trashed=false",
+            fields="files(id,name,mimeType,createdTime)",
+            orderBy="createdTime desc", pageSize=50,
+            supportsAllDrives=True, includeItemsFromAllDrives=True).execute()
+        for f in resp.get("files", []):
+            mt = f.get("mimeType", "")
+            nm = f.get("name", "").lower()
+            if mt.startswith("audio/") or nm.endswith(AUDIO_EXT):
+                return f["id"], f["name"]
+        return None
+
+    def _download_audio(self, service, file_id, name):
+        from googleapiclient.http import MediaIoBaseDownload
+        ext = os.path.splitext(name)[1] or ".mp3"
+        dest = os.path.join(self.work_dir, f"{self.tag}_audio{ext}")
+        req = service.files().get_media(fileId=file_id, supportsAllDrives=True)
+        with open(dest, "wb") as fh:
+            dl = MediaIoBaseDownload(fh, req)
+            done = False
+            while not done:
+                _, done = dl.next_chunk()
+        return dest
+
+    def _mux_audio(self, video_path, audio_path):
+        """Add audio to a silent video (video copied, audio -> aac). Audio is
+        looped if shorter than the video and trimmed to the video length.
+        Returns the muxed path, or None on failure."""
+        log_path = os.path.join(self.work_dir, f"{self.tag}_ffmpeg.log")
+        base, _ = os.path.splitext(video_path)
+        out_path = base + "_audio.mp4"
+        dur = probe_duration(video_path)
+        cmd = ["ffmpeg", "-y", "-loglevel", "error",
+               "-i", video_path,
+               "-stream_loop", "-1", "-i", audio_path,
+               "-map", "0:v:0", "-map", "1:a:0",
+               "-c:v", "copy", "-c:a", "aac", "-b:a", str(_cfg("AUDIO_BITRATE", "192k")),
+               "-shortest"]
+        if dur and dur > 0:
+            cmd += ["-t", f"{dur:.3f}"]
+        cmd += [out_path]
+        result = self._run_ffmpeg(cmd, log_path, cwd=self.work_dir)
+        if result == "ok" and os.path.exists(out_path):
+            return out_path
+        self.log.warning("Audio mux failed (%s); keeping silent video.", result)
+        if os.path.exists(out_path):
+            try:
+                os.remove(out_path)
+            except OSError:
+                pass
+        return None
+
+    def _add_audio(self):
+        """Fetch the latest audio from the Drive folder and mux it onto
+        self.final_path in place. Never raises fatally to the caller."""
+        folder_id = _cfg("GDRIVE_AUDIO_FOLDER_ID", "")
+        if not folder_id or not self.final_path:
+            return
+        service = self._drive_service()
+        latest = self._latest_audio_file(service, folder_id)
+        if not latest:
+            self.log.info("No audio in the Drive folder yet; uploading silent video.")
+            return
+        file_id, name = latest
+        self.log.info("Merging background audio: %s", name)
+        audio_path = self._download_audio(service, file_id, name)
+        muxed = self._mux_audio(self.final_path, audio_path)
+        try:
+            os.remove(audio_path)
+        except OSError:
+            pass
+        if muxed and os.path.exists(muxed):
+            silent = self.final_path
+            try:
+                os.remove(silent)
+            except OSError:
+                pass
+            os.replace(muxed, silent)   # keep the original filename
+            self.final_path = silent
+            self.log.info("  audio merged onto %s.", os.path.basename(silent))
+
+    def _upload(self, local_path):
         from googleapiclient.http import MediaFileUpload
 
-        creds = self._drive_credentials()
-        service = build("drive", "v3", credentials=creds)
+        service = self._drive_service()
         meta = {"name": os.path.basename(local_path)}
         if config.GDRIVE_FOLDER_ID:
             meta["parents"] = [config.GDRIVE_FOLDER_ID]
@@ -590,7 +684,8 @@ class RecordingJob:
         final only if the caller asked to. Always safe to call."""
         if not self.tag:
             return
-        patterns = [f"{self.tag}_seg*.mp4", f"{self.tag}_ts*.ts", f"{self.tag}_ffmpeg.log"]
+        patterns = [f"{self.tag}_seg*.mp4", f"{self.tag}_ts*.ts", f"{self.tag}_ffmpeg.log",
+                    f"{self.tag}_audio.*", f"{self.tag}_*x_audio.mp4"]
         removed = 0
         for pat in patterns:
             for p in glob.glob(os.path.join(self.work_dir, pat)):
@@ -656,6 +751,13 @@ class RecordingJob:
                 self.state = JobState.ERROR
                 self.error = "Speed-up failed."
                 return
+
+            # 3.5) optional: mux the latest background audio from the Drive folder
+            if _cfg("AUDIO_ENABLED", False):
+                try:
+                    self._add_audio()
+                except Exception as e:                       # noqa: BLE001
+                    self.log.warning("Audio merge skipped (%s); uploading silent video.", e)
 
             # 4) upload
             uploaded = False

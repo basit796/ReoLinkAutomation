@@ -41,6 +41,8 @@ _CONFIG_FIELDS = {
     "CROP_TOP": float,
     "CROP_BOTTOM": float,
     "GDRIVE_FOLDER_ID": str,
+    "AUDIO_ENABLED": bool,
+    "GDRIVE_AUDIO_FOLDER_ID": str,
 }
 
 # Scheduler-only fields (not config attributes). key -> (type, config default attr)

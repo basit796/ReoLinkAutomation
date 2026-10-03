@@ -8,6 +8,8 @@
   "CROP_TOP": 0.03,
   "CROP_BOTTOM": 0.24,
   "GDRIVE_FOLDER_ID": "1OAmwqeYSDaQJnNYTDuPXlx5b-2mRVS-I",
+  "AUDIO_ENABLED": true,
+  "GDRIVE_AUDIO_FOLDER_ID": "1eRdSbDSCR6T0BUK3t_RZ2ih2FSps-uD2",
   "enabled": true,
   "start_time": "06:00",
   "end_time": "08:00",
